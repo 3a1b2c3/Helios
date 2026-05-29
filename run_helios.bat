@@ -181,9 +181,10 @@ echo.
 if "%SKIP_DOWNLOAD%"=="1" goto :phase_run
 
 echo --- pre-fetching HF snapshot: !HF_REPO! ---
-echo     skipping redundant fine-tune mirror dirs ^(transformer_init/, transformer_ode/^)
-echo     saves ~60 GB ^(full snapshot is ~138 GB; inference subset is ~80 GB^)
-"!VENV_PY!" -c "import os; os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER','0'); from huggingface_hub import snapshot_download; p = snapshot_download('!HF_REPO!', max_workers=1, ignore_patterns=['transformer_init/*','transformer_ode/*']); print('snapshot at:', p)"
+echo     skipping transformer_init/ ^(fine-tune mirror, not used at inference^)
+echo     including transformer_ode/ ^(needed by --is_enable_stage2^)
+echo     subset ~131 GB ^(full snapshot ~138 GB; saves ~7 GB by skipping transformer_init^)
+"!VENV_PY!" -c "import os; os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER','0'); from huggingface_hub import snapshot_download; p = snapshot_download('!HF_REPO!', max_workers=1, ignore_patterns=['transformer_init/*']); print('snapshot at:', p)"
 if errorlevel 1 ( echo ERROR: HF download failed & exit /b 1 )
 echo.
 
