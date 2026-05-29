@@ -241,16 +241,17 @@ def main():
         transformer = replace_rmsnorm_with_fp32(transformer)
         transformer = replace_all_norms_with_flash_norms(transformer)
         replace_rope_with_flash_rope()
-    # Prefer the locally-installed `flash_attn` package over diffusers' hub
-    # backends (`_flash_3_hub` / `flash_hub`) — those fetch
+    # Prefer locally-installed `sageattention` (diffusers backend "_sage") over
+    # hub backends (`_flash_3_hub` / `flash_hub`) — those fetch
     # `kernels-community/flash-attn{2,3}` which ship Linux-only build variants
-    # and raise FileNotFoundError on Windows. The local FA2 wheel works on
-    # sm_120; if it's missing, diffusers' default (SDPA) handles attention.
+    # and raise FileNotFoundError on Windows. sageattention is a universal
+    # py3-none-any wheel that JITs through Triton for sm_120; if it's missing,
+    # diffusers' default (SDPA) handles attention.
     try:
-        transformer.set_attention_backend("flash_attn")
-        print("[helios] attention backend set: flash_attn (local)")
+        transformer.set_attention_backend("_sage")
+        print("[helios] attention backend set: _sage (local sageattention)")
     except Exception as e:
-        print(f"[helios] local flash_attn backend unavailable ({type(e).__name__}: {str(e)[:120]}); "
+        print(f"[helios] local _sage backend unavailable ({type(e).__name__}: {str(e)[:120]}); "
               "using diffusers default (SDPA)")
 
     vae = AutoencoderKLWan.from_pretrained(

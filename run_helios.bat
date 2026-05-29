@@ -19,6 +19,29 @@
 ::   HELIOS_VENV=C:\path\to\.venv            default: %~dp0.venv
 ::   HF_HOME=C:\path\to\hf-cache             default: %USERPROFILE%\.cache\huggingface
 
+:: --- log capture wrapper: on first invocation, re-exec ourselves with full
+:: stdout/stderr redirected to logs\helios_<timestamp>.log so every phase
+:: (setup install lines, pre-fetch download, inference) lands in one file.
+:: Tail in another terminal:  Get-Content -Wait "<path printed below>"
+if not defined HELIOS_LOG_REENTRY (
+    setlocal EnableExtensions EnableDelayedExpansion
+    if not exist "%~dp0logs" mkdir "%~dp0logs"
+    for /f "tokens=2 delims==" %%I in ('wmic os get localdatetime /value ^| findstr "="') do set "LDT=%%I"
+    set "HELIOS_LOG=%~dp0logs\helios_!LDT:~0,8!_!LDT:~8,6!.log"
+    echo Helios run logging to: !HELIOS_LOG!
+    echo Tail in another terminal:  Get-Content -Wait "!HELIOS_LOG!"
+    echo.
+    set "HELIOS_LOG_REENTRY=1"
+    call "%~f0" %* > "!HELIOS_LOG!" 2>&1
+    set "EXIT=!ERRORLEVEL!"
+    echo.
+    echo --- last 40 log lines ---
+    powershell -NoProfile -Command "Get-Content -LiteralPath '!HELIOS_LOG!' -Tail 40"
+    echo.
+    echo Full log: !HELIOS_LOG!
+    endlocal & exit /b %EXIT%
+)
+
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
@@ -26,7 +49,7 @@ cd /d "%~dp0"
 :: Default: download + run. --setup opts the setup phase back in; --skip-run
 :: opts the run phase out. Legacy --run flag kept as a no-op so existing
 :: command lines don't break.
-set "MODE=t2v"
+set "MODE=i2v"
 set "SKIP_SETUP=1"
 set "SKIP_DOWNLOAD=0"
 set "SKIP_RUN=0"
@@ -111,6 +134,14 @@ if errorlevel 1 ( echo ERROR: torch install failed & exit /b 1 )
 echo --- installing triton-windows ^(replaces Linux triton on Windows^) ---
 "!UV_EXE!" pip install --python "!VENV_PY!" triton-windows
 if errorlevel 1 ( echo WARN: triton-windows install failed -- continuing, torch.compile may not work )
+
+:: sageattention is universal py3-none-any on PyPI; kernels JIT-compile through
+:: Triton for sm_120 at first call. Diffusers exposes it via backend name "_sage".
+:: Cheap to install (no compile) and gives ~FA2-class perf without the wheel
+:: pinning headaches of flash-attn.
+echo --- installing sageattention ^(Triton-JIT attention; needs triton-windows^) ---
+"!UV_EXE!" pip install --python "!VENV_PY!" sageattention
+if errorlevel 1 ( echo WARN: sageattention install failed -- continuing, attention falls back to SDPA )
 
 :: Build a Windows-safe requirements file by filtering out Linux-only lines
 :: and the triton pin (which has no Windows wheel). findstr /V drops any
@@ -255,6 +286,7 @@ echo   entry    : !ENTRY!
 echo   output   : %~dp0output_helios\
 echo.
 
+:: Python's -X utf8 guarantees UTF-8 stdout/stderr so the bat-level log is decodable.
 "!VENV_PY!" -X utf8 "!ENTRY!" %COMMON_ARGS% %MODE_ARGS% --prompt "!PROMPT!" %LOW_VRAM_ARGS%
 set "EXIT_CODE=!ERRORLEVEL!"
 
