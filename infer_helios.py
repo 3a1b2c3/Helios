@@ -293,6 +293,13 @@ def main():
         pipe.transformer.compile(mode="max-autotune-no-cudagraphs", dynamic=False)
 
     if args.enable_low_vram_mode:
+        # low_cpu_mem_usage=True bypasses diffusers' per-parameter pin_memory() call
+        # in group_offloading._to_cpu, which crashes on Windows + 5090 with
+        # `cudaErrorAlreadyMapped`: BAR1 PCIe-mapped GPU memory is finite (~256 MB
+        # on consumer Blackwell) and the bulk-pin loop for a 14B model exhausts it
+        # within the first few blocks. Skipping the pin means transfers go through
+        # pageable host memory instead of page-locked — slightly slower CPU<->GPU
+        # bandwidth, but actually runs.
         pipe.enable_group_offload(
             onload_device=torch.device("cuda"),
             offload_device=torch.device("cpu"),
@@ -300,6 +307,7 @@ def main():
             num_blocks_per_group=args.num_blocks_per_group if args.group_offloading_type == "block_level" else None,
             use_stream=True,
             record_stream=True,
+            low_cpu_mem_usage=True,
         )
     else:
         pipe = pipe.to(device)

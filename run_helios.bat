@@ -32,7 +32,12 @@ if not defined HELIOS_LOG_REENTRY (
     echo Tail in another terminal:  Get-Content -Wait "!HELIOS_LOG!"
     echo.
     set "HELIOS_LOG_REENTRY=1"
-    call "%~f0" %* > "!HELIOS_LOG!" 2>&1
+    REM Tee both stdout/stderr through to the console AND the log file so the
+    REM user sees live progress (incl. tqdm bars) and we still get a captured
+    REM artifact. Tee-Object writes UTF-16 LE on PS 5.1 (no -Encoding flag until
+    REM PS 7) but the file is still decodable; trade-off is acceptable vs.
+    REM ForEach-Object + Out-File which would break tqdm \r-redraws.
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%~f0' %* 2>&1 | Tee-Object -FilePath '!HELIOS_LOG!'; exit $LASTEXITCODE"
     set "EXIT=!ERRORLEVEL!"
     echo.
     echo --- last 40 log lines ---
