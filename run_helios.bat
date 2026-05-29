@@ -1,0 +1,227 @@
+@echo off
+:: Windows launcher for PKU-YuanGroup/Helios -- one-shot setup + model download + example run.
+:: Mirrors the FastVideo run_matrixgame3.bat / run_cosmos.bat pattern.
+::
+:: Usage:
+::   run_helios.bat                          DEFAULT: download only (skip setup + run)
+::   run_helios.bat --setup                  also build the venv + install deps
+::   run_helios.bat --run                    also run the example after download
+::   run_helios.bat --setup --run            full flow
+::   run_helios.bat --mode i2v               image-to-video (uses example/wave.jpg)
+::   run_helios.bat --skip-download          skip download (assume cached) — useful with --run
+::   run_helios.bat --low-vram               enable group offloading (single 5090 / 32 GB)
+::
+:: Only the distilled variant is supported here (it's the only one we care about
+:: for 5090 inference, and base/mid are ~138 GB each — not worth caching).
+::
+:: Env overrides:
+::   HELIOS_VENV=C:\path\to\.venv            default: %~dp0.venv
+::   HF_HOME=C:\path\to\hf-cache             default: %USERPROFILE%\.cache\huggingface
+
+setlocal EnableExtensions EnableDelayedExpansion
+cd /d "%~dp0"
+
+:: --- arg parse ---
+:: Default: download only. --setup/--run opt the other phases back in.
+:: Legacy --skip-* flags kept for backwards compat (now mostly no-ops).
+set "MODE=t2v"
+set "SKIP_SETUP=1"
+set "SKIP_DOWNLOAD=0"
+set "SKIP_RUN=1"
+set "LOW_VRAM=0"
+:parse
+if "%~1"=="" goto args_done
+if /I "%~1"=="--mode"          ( set "MODE=%~2" & shift & shift & goto parse )
+if /I "%~1"=="--setup"         ( set "SKIP_SETUP=0" & shift & goto parse )
+if /I "%~1"=="--run"           ( set "SKIP_RUN=0" & shift & goto parse )
+if /I "%~1"=="--skip-setup"    ( set "SKIP_SETUP=1" & shift & goto parse )
+if /I "%~1"=="--skip-download" ( set "SKIP_DOWNLOAD=1" & shift & goto parse )
+if /I "%~1"=="--skip-run"      ( set "SKIP_RUN=1" & shift & goto parse )
+if /I "%~1"=="--low-vram"      ( set "LOW_VRAM=1" & shift & goto parse )
+if /I "%~1"=="--help"          goto :help
+if /I "%~1"=="-h"              goto :help
+echo ERROR: unknown arg %~1
+exit /b 2
+:args_done
+
+:: Distilled variant only — best efficiency on 5090, ~80 GB after filtering
+:: out the redundant transformer_ode mirror dir.
+set "VARIANT=distilled"
+set "HF_REPO=BestWishYsh/Helios-Distilled"
+
+:: --- paths ---
+if not defined HELIOS_VENV set "HELIOS_VENV=%~dp0.venv"
+set "VENV_PY=!HELIOS_VENV!\Scripts\python.exe"
+set "ENTRY=%~dp0infer_helios.py"
+
+:: uv on Windows typically installs to %USERPROFILE%\.local\bin which is on
+:: PowerShell's PATH but not cmd's. Prepend it so `where uv` finds it from cmd.
+set "PATH=%USERPROFILE%\.local\bin;%PATH%"
+where uv >nul 2>nul
+if errorlevel 1 (
+    echo ERROR: uv.exe not on PATH. Install uv first: https://docs.astral.sh/uv/
+    echo Tried: %%USERPROFILE%%\.local\bin
+    exit /b 2
+)
+for /f "delims=" %%U in ('where uv') do set "UV_EXE=%%U" & goto :uv_found
+:uv_found
+
+:: --- Strip ambient venv state so spawned interpreter doesn't graft another
+::     venv's stdlib path (the SRE / _sre mismatch). ---
+set "VIRTUAL_ENV="
+set "PYTHONHOME="
+set "PYTHONPATH="
+
+echo ============================================================
+echo Helios real-time long video generation
+echo ============================================================
+echo   venv     : !HELIOS_VENV!
+echo   mode     : %MODE%
+echo   variant  : distilled  ^(repo: !HF_REPO!^)
+echo   low-vram : %LOW_VRAM%  ^(group offload on if 1^)
+echo   skip     : setup=%SKIP_SETUP%  download=%SKIP_DOWNLOAD%  run=%SKIP_RUN%
+echo ============================================================
+echo.
+
+:: ============================================================
+:: 1/3  setup venv + deps
+:: ============================================================
+if "%SKIP_SETUP%"=="1" goto :phase_download
+
+if not exist "!VENV_PY!" (
+    echo --- creating venv at !HELIOS_VENV! ^(Python 3.11^) ---
+    "!UV_EXE!" venv "!HELIOS_VENV!" --python 3.11
+    if errorlevel 1 ( echo ERROR: uv venv failed & exit /b 1 )
+)
+
+echo --- installing torch 2.10.0 + cu128 ---
+"!UV_EXE!" pip install --python "!VENV_PY!" torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+if errorlevel 1 ( echo ERROR: torch install failed & exit /b 1 )
+
+:: triton-windows BEFORE the requirements pass so triton is already satisfied
+:: when uv reads `triton==3.6.0` from requirements.txt (we filter that line
+:: out below, but installing triton-windows first also blocks any transitive
+:: triton install from trying the Linux PyPI build). Pinning to a recent
+:: triton-windows tracking torch 2.10 -- let uv pick the matching wheel.
+echo --- installing triton-windows ^(replaces Linux triton on Windows^) ---
+"!UV_EXE!" pip install --python "!VENV_PY!" triton-windows
+if errorlevel 1 ( echo WARN: triton-windows install failed -- continuing, torch.compile may not work )
+
+:: Build a Windows-safe requirements file by filtering out Linux-only lines
+:: and the triton pin (which has no Windows wheel). findstr /V drops any
+:: line starting with one of the listed prefixes.
+set "REQS_WIN=%TEMP%\helios_reqs_win.txt"
+findstr /V /B /R /C:"triton" /C:"deepspeed" /C:"mpi4py" /C:"tf_keras" /C:"tensorflow" /C:"# " "%~dp0requirements.txt" > "!REQS_WIN!"
+echo --- installing Helios requirements ^(filtered for Windows^) ---
+echo     filtered out: triton, deepspeed, mpi4py, tf_keras, tensorflow
+echo     file: !REQS_WIN!
+"!UV_EXE!" pip install --python "!VENV_PY!" -r "!REQS_WIN!"
+if errorlevel 1 (
+    echo WARN: requirements install had errors -- retrying with --no-deps and selective backfill
+    "!UV_EXE!" pip install --python "!VENV_PY!" -r "!REQS_WIN!" --no-deps
+    "!UV_EXE!" pip install --python "!VENV_PY!" kernels==0.13.0 transformers==5.3.0 sentence-transformers==5.2.3 accelerate==1.12.0 peft==0.18.1 "huggingface-hub>=1.4.1" zstandard==0.25.0 wandb==0.23.0 "numpy<2.0.0" opencv-python gradio moviepy imageio-ffmpeg ftfy Jinja2 einops packaging ninja omegaconf loguru
+    if errorlevel 1 ( echo ERROR: deps install failed even after fallback & exit /b 1 )
+)
+
+echo --- installing diffusers from main ^(Helios needs ContextParallelConfig^) ---
+"!UV_EXE!" pip install --python "!VENV_PY!" "git+https://github.com/huggingface/diffusers.git"
+if errorlevel 1 ( echo ERROR: diffusers install failed & exit /b 1 )
+
+echo --- removing leftover wandb/triton cache ---
+if exist "%USERPROFILE%\.triton\cache" rmdir /s /q "%USERPROFILE%\.triton\cache"
+
+echo Setup complete: !HELIOS_VENV!
+echo.
+
+:: ============================================================
+:: 2/3  download model snapshot
+:: ============================================================
+:phase_download
+if "%SKIP_DOWNLOAD%"=="1" goto :phase_run
+
+echo --- pre-fetching HF snapshot: !HF_REPO! ---
+echo     skipping redundant fine-tune mirror dirs ^(transformer_init/, transformer_ode/^)
+echo     saves ~60 GB ^(full snapshot is ~138 GB; inference subset is ~80 GB^)
+"!VENV_PY!" -c "import os; os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER','0'); from huggingface_hub import snapshot_download; p = snapshot_download('!HF_REPO!', max_workers=1, ignore_patterns=['transformer_init/*','transformer_ode/*']); print('snapshot at:', p)"
+if errorlevel 1 ( echo ERROR: HF download failed & exit /b 1 )
+echo.
+
+:: ============================================================
+:: 3/3  run example
+:: ============================================================
+:phase_run
+if "%SKIP_RUN%"=="1" (
+    echo Run skipped ^(--skip-run^).
+    exit /b 0
+)
+
+:: --- Windows env tweaks (same as run_matrixgame3.bat / run_cosmos.bat) ---
+if not defined GLOO_SOCKET_IFNAME set "GLOO_SOCKET_IFNAME=Wi-Fi"
+set "HF_DEACTIVATE_ASYNC_LOAD=1"
+set "HF_HUB_ENABLE_HF_TRANSFER=0"
+set "USE_LIBUV=0"
+set "TORCH_TCPSTORE_USE_LIBUV=0"
+set "PYTHONIOENCODING=utf-8"
+set "CUDA_VISIBLE_DEVICES=0"
+
+:: Mode-specific args. Defaults match scripts/inference/helios-*_*.sh.
+:: 384x640 / 99 frames / 24fps -> ~4s clip, fits 32 GB 5090 with distilled
+:: at bf16. Bump --num_frames for longer clips (must remain divisible by 9).
+set "COMMON_ARGS=--base_model_path !HF_REPO! --transformer_path !HF_REPO! --weight_dtype bf16 --height 384 --width 640 --num_frames 99 --fps 24 --guidance_scale 5.0 --seed 42 --output_folder %~dp0output_helios"
+
+set "MODE_ARGS="
+if /I "%MODE%"=="t2v" set "MODE_ARGS=--sample_type t2v --prompt \"A vibrant tropical fish swimming gracefully among colorful coral reefs in a clear, turquoise ocean. Bright blue and yellow scales, dynamic motion, close-up shot.\""
+if /I "%MODE%"=="i2v" set "MODE_ARGS=--sample_type i2v --image_path %~dp0example\wave.jpg --image_noise_sigma_min 0.111 --image_noise_sigma_max 0.135 --prompt \"A towering emerald wave surges forward, its crest curling with raw power. Sunlight glints off the translucent water. Dynamic motion, cinematic shot.\""
+if /I "%MODE%"=="v2v" set "MODE_ARGS=--sample_type v2v --video_path %~dp0example\car.mp4 --prompt \"A red sports car driving down a winding mountain road at dusk. Cinematic, dynamic motion.\""
+if not defined MODE_ARGS (
+    echo ERROR: --mode must be t2v^|i2v^|v2v ^(got %MODE%^)
+    exit /b 2
+)
+
+set "LOW_VRAM_ARGS="
+if "%LOW_VRAM%"=="1" set "LOW_VRAM_ARGS=--enable_low_vram_mode --group_offloading_type leaf_level --num_blocks_per_group 4"
+
+echo --- running infer_helios.py ---
+echo   python   : !VENV_PY!
+echo   entry    : !ENTRY!
+echo   output   : %~dp0output_helios\
+echo.
+
+"!VENV_PY!" -X utf8 "!ENTRY!" %COMMON_ARGS% %MODE_ARGS% %LOW_VRAM_ARGS%
+set "EXIT_CODE=!ERRORLEVEL!"
+
+if not !EXIT_CODE!==0 (
+    echo.
+    echo ERROR: infer_helios exited with code !EXIT_CODE!
+    echo Common causes:
+    echo   - OOM on 5090: retry with --low-vram
+    echo   - Missing CUDA toolkit: ensure CUDA 12.8 runtime is on PATH
+    echo   - flash-attn / triton missing on Windows: --enable_compile drops a warning, output still ok
+    exit /b !EXIT_CODE!
+)
+
+echo.
+echo --- done ---
+echo videos at: %~dp0output_helios\
+exit /b 0
+
+:help
+echo Usage:
+echo   run_helios.bat                          DEFAULT: download only ^(distilled^)
+echo   run_helios.bat --setup                  also build venv + install deps
+echo   run_helios.bat --run                    also run the example after download
+echo   run_helios.bat --setup --run            full flow
+echo   run_helios.bat --mode i2v               image-to-video
+echo   run_helios.bat --mode v2v               video-to-video
+echo   run_helios.bat --skip-download          skip download ^(assume cached^)
+echo   run_helios.bat --low-vram               group offload for tight VRAM
+echo.
+echo Note: only the distilled variant is supported. base/mid would each cost
+echo another ~138 GB ^(or ~80 GB filtered^) — not worth it for this disk.
+echo.
+echo Model:
+echo   BestWishYsh/Helios-Distilled  ~80 GB after filter ^(DMD-distilled, 5090-friendly^)
+echo   ^(transformer_ode mirror dir is skipped to save ~60 GB^)
+echo.
+echo Output: %~dp0output_helios\
+exit /b 0
