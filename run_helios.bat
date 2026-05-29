@@ -3,13 +3,14 @@
 :: Mirrors the FastVideo run_matrixgame3.bat / run_cosmos.bat pattern.
 ::
 :: Usage:
-::   run_helios.bat                          DEFAULT: download only (skip setup + run)
+::   run_helios.bat                          DEFAULT: download + run (skip setup)
 ::   run_helios.bat --setup                  also build the venv + install deps
-::   run_helios.bat --run                    also run the example after download
-::   run_helios.bat --setup --run            full flow
+::   run_helios.bat --skip-run               download only, don't run inference
+::   run_helios.bat --setup                  full flow (setup + download + run)
 ::   run_helios.bat --mode i2v               image-to-video (uses example/wave.jpg)
-::   run_helios.bat --skip-download          skip download (assume cached) — useful with --run
-::   run_helios.bat --low-vram               enable group offloading (single 5090 / 32 GB)
+::   run_helios.bat --skip-download          skip download (assume cached)
+::   run_helios.bat --low-vram               enable group offloading (default; needed on single 5090 / 32 GB)
+::   run_helios.bat --high-vram              disable group offloading (only on >32 GB VRAM)
 ::
 :: Only the distilled variant is supported here (it's the only one we care about
 :: for 5090 inference, and base/mid are ~138 GB each — not worth caching).
@@ -22,13 +23,16 @@ setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 :: --- arg parse ---
-:: Default: download only. --setup/--run opt the other phases back in.
-:: Legacy --skip-* flags kept for backwards compat (now mostly no-ops).
+:: Default: download + run. --setup opts the setup phase back in; --skip-run
+:: opts the run phase out. Legacy --run flag kept as a no-op so existing
+:: command lines don't break.
 set "MODE=t2v"
 set "SKIP_SETUP=1"
 set "SKIP_DOWNLOAD=0"
-set "SKIP_RUN=1"
-set "LOW_VRAM=0"
+set "SKIP_RUN=0"
+:: Default to --low-vram: 5090 (32 GB) OOMs on Helios-14B at default settings.
+:: Pass --high-vram to opt out on hardware with more headroom.
+set "LOW_VRAM=1"
 :parse
 if "%~1"=="" goto args_done
 if /I "%~1"=="--mode"          ( set "MODE=%~2" & shift & shift & goto parse )
@@ -38,6 +42,7 @@ if /I "%~1"=="--skip-setup"    ( set "SKIP_SETUP=1" & shift & goto parse )
 if /I "%~1"=="--skip-download" ( set "SKIP_DOWNLOAD=1" & shift & goto parse )
 if /I "%~1"=="--skip-run"      ( set "SKIP_RUN=1" & shift & goto parse )
 if /I "%~1"=="--low-vram"      ( set "LOW_VRAM=1" & shift & goto parse )
+if /I "%~1"=="--high-vram"     ( set "LOW_VRAM=0" & shift & goto parse )
 if /I "%~1"=="--help"          goto :help
 if /I "%~1"=="-h"              goto :help
 echo ERROR: unknown arg %~1
@@ -127,6 +132,42 @@ echo --- installing diffusers from main ^(Helios needs ContextParallelConfig^) -
 "!UV_EXE!" pip install --python "!VENV_PY!" "git+https://github.com/huggingface/diffusers.git"
 if errorlevel 1 ( echo ERROR: diffusers install failed & exit /b 1 )
 
+:: flash-attn (Windows prebuild from mjun0812). Helios uses SDPA otherwise, so
+:: this is a perf win, not a correctness requirement. Skipped unless the user
+:: sets HELIOS_FLASH_ATTN_WHEEL=<url-or-path> — flash-attn is torch-minor-version
+:: locked (C++ ABI), so we don't ship a default URL; pick a wheel that matches
+:: your venv's torch (currently 2.10) + cu128 + cp311 + win.
+::
+:: Verified: torch2.8 wheels FAIL on torch2.10 with `DLL load failed while
+:: importing flash_attn_2_cuda: The specified procedure could not be found.`
+::
+:: Wheels list: https://github.com/mjun0812/flash-attention-prebuild-wheels/releases
+:: See reference_windows_wheels.md.
+if defined HELIOS_FLASH_ATTN_WHEEL (
+    echo --- installing flash-attn ^(Windows prebuild, sm_120^) ---
+    echo     wheel: !HELIOS_FLASH_ATTN_WHEEL!
+    "!UV_EXE!" pip install --python "!VENV_PY!" "!HELIOS_FLASH_ATTN_WHEEL!"
+    if not errorlevel 1 (
+        :: Verify it imports — pip install succeeds even when the CUDA DLL has
+        :: ABI mismatches with the runtime torch. Roll back on import failure.
+        "!VENV_PY!" -c "import flash_attn" 2>nul
+        if errorlevel 1 (
+            echo WARN: flash-attn installed but failed to import ^(C++ ABI mismatch^).
+            echo       Rolling back so Helios falls back cleanly to PyTorch SDPA.
+            "!UV_EXE!" pip uninstall --python "!VENV_PY!" flash-attn >nul 2>nul
+        ) else (
+            echo flash-attn imports OK.
+        )
+    ) else (
+        echo WARN: flash-attn install failed -- Helios will fall back to PyTorch SDPA.
+    )
+) else (
+    echo --- flash-attn install skipped ^(set HELIOS_FLASH_ATTN_WHEEL to enable^) ---
+    echo     Helios will use PyTorch SDPA. For a perf boost, point at a wheel built
+    echo     against this venv's torch ^(check `pip show torch` for the version^):
+    echo       https://github.com/mjun0812/flash-attention-prebuild-wheels/releases
+)
+
 echo --- removing leftover wandb/triton cache ---
 if exist "%USERPROFILE%\.triton\cache" rmdir /s /q "%USERPROFILE%\.triton\cache"
 
@@ -167,12 +208,38 @@ set "CUDA_VISIBLE_DEVICES=0"
 :: Mode-specific args. Defaults match scripts/inference/helios-*_*.sh.
 :: 384x640 / 99 frames / 24fps -> ~4s clip, fits 32 GB 5090 with distilled
 :: at bf16. Bump --num_frames for longer clips (must remain divisible by 9).
-set "COMMON_ARGS=--base_model_path !HF_REPO! --transformer_path !HF_REPO! --weight_dtype bf16 --height 384 --width 640 --num_frames 99 --fps 24 --guidance_scale 5.0 --seed 42 --output_folder %~dp0output_helios"
+::
+:: --is_enable_stage2 is REQUIRED for the Helios-Distilled checkpoint: it's a
+:: pyramid/multi-stage model. Without the flag the pipeline takes the single-
+:: stage branch (pipeline_helios_diffusers.py:1254) and crashes with
+::   KeyError: None  at scheduling_helios_diffusers.py:227
+::     stage_timesteps = self.timesteps_per_stage[stage_index]
+:: because stage_index defaults to None on that call. Override stage2 off via
+:: HELIOS_NO_STAGE2=1 if you ever point this at a single-stage checkpoint.
+set "STAGE2_ARG=--is_enable_stage2"
+if defined HELIOS_NO_STAGE2 if not "%HELIOS_NO_STAGE2%"=="0" set "STAGE2_ARG="
+set "COMMON_ARGS=--base_model_path !HF_REPO! --transformer_path !HF_REPO! --weight_dtype bf16 --height 384 --width 640 --num_frames 99 --fps 24 --guidance_scale 5.0 --seed 42 --output_folder %~dp0output_helios !STAGE2_ARG!"
 
+:: Prompts and per-mode extra args. The PROMPT variable holds the text WITHOUT
+:: enclosing quotes — quoting happens at the python.exe invocation line below.
+:: Putting `\"…\"` inside `set "MODE_ARGS=…"` doesn't survive: CMD strips the
+:: outer quotes, leaving literal `\"…\"` that MSVC's argv parser then mangles
+:: (the prompt's first word gets eaten by --prompt and the rest become unknown
+:: positionals, e.g. `unrecognized arguments: vibrant tropical fish …`).
+set "PROMPT="
 set "MODE_ARGS="
-if /I "%MODE%"=="t2v" set "MODE_ARGS=--sample_type t2v --prompt \"A vibrant tropical fish swimming gracefully among colorful coral reefs in a clear, turquoise ocean. Bright blue and yellow scales, dynamic motion, close-up shot.\""
-if /I "%MODE%"=="i2v" set "MODE_ARGS=--sample_type i2v --image_path %~dp0example\wave.jpg --image_noise_sigma_min 0.111 --image_noise_sigma_max 0.135 --prompt \"A towering emerald wave surges forward, its crest curling with raw power. Sunlight glints off the translucent water. Dynamic motion, cinematic shot.\""
-if /I "%MODE%"=="v2v" set "MODE_ARGS=--sample_type v2v --video_path %~dp0example\car.mp4 --prompt \"A red sports car driving down a winding mountain road at dusk. Cinematic, dynamic motion.\""
+if /I "%MODE%"=="t2v" (
+    set "MODE_ARGS=--sample_type t2v"
+    set "PROMPT=A vibrant tropical fish swimming gracefully among colorful coral reefs in a clear, turquoise ocean. Bright blue and yellow scales, dynamic motion, close-up shot."
+)
+if /I "%MODE%"=="i2v" (
+    set "MODE_ARGS=--sample_type i2v --image_path %~dp0example\wave.jpg --image_noise_sigma_min 0.111 --image_noise_sigma_max 0.135"
+    set "PROMPT=A towering emerald wave surges forward, its crest curling with raw power. Sunlight glints off the translucent water. Dynamic motion, cinematic shot."
+)
+if /I "%MODE%"=="v2v" (
+    set "MODE_ARGS=--sample_type v2v --video_path %~dp0example\car.mp4"
+    set "PROMPT=A red sports car driving down a winding mountain road at dusk. Cinematic, dynamic motion."
+)
 if not defined MODE_ARGS (
     echo ERROR: --mode must be t2v^|i2v^|v2v ^(got %MODE%^)
     exit /b 2
@@ -187,7 +254,7 @@ echo   entry    : !ENTRY!
 echo   output   : %~dp0output_helios\
 echo.
 
-"!VENV_PY!" -X utf8 "!ENTRY!" %COMMON_ARGS% %MODE_ARGS% %LOW_VRAM_ARGS%
+"!VENV_PY!" -X utf8 "!ENTRY!" %COMMON_ARGS% %MODE_ARGS% --prompt "!PROMPT!" %LOW_VRAM_ARGS%
 set "EXIT_CODE=!ERRORLEVEL!"
 
 if not !EXIT_CODE!==0 (
@@ -207,14 +274,15 @@ exit /b 0
 
 :help
 echo Usage:
-echo   run_helios.bat                          DEFAULT: download only ^(distilled^)
+echo   run_helios.bat                          DEFAULT: download + run ^(distilled^)
 echo   run_helios.bat --setup                  also build venv + install deps
-echo   run_helios.bat --run                    also run the example after download
-echo   run_helios.bat --setup --run            full flow
+echo   run_helios.bat --skip-run               download only, don't run inference
+echo   run_helios.bat --setup                  full flow ^(setup + download + run^)
 echo   run_helios.bat --mode i2v               image-to-video
 echo   run_helios.bat --mode v2v               video-to-video
 echo   run_helios.bat --skip-download          skip download ^(assume cached^)
-echo   run_helios.bat --low-vram               group offload for tight VRAM
+echo   run_helios.bat --low-vram               group offload ^(default^)
+echo   run_helios.bat --high-vram              disable group offload ^(needs ^>32 GB VRAM^)
 echo.
 echo Note: only the distilled variant is supported. base/mid would each cost
 echo another ~138 GB ^(or ~80 GB filtered^) — not worth it for this disk.

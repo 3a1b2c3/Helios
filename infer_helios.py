@@ -242,15 +242,34 @@ def main():
         transformer = replace_all_norms_with_flash_norms(transformer)
         replace_rope_with_flash_rope()
     cuda_major = torch.cuda.get_device_capability()[0]
-    if cuda_major >= 9:
-        # H100/H800 (SM90+) with FA3
+    # Both "_flash_3_hub" and "flash_hub" route through diffusers'
+    # `_maybe_download_kernel_for_backend` -> `kernels.get_kernel(...)`. On
+    # Windows the pinned revisions of `kernels-community/flash-attn{2,3}` ship
+    # only Linux/aarch64 build variants (HF kernels: no Windows variant at the
+    # pinned commit), so the call raises `FileNotFoundError` BEFORE the
+    # transformer ever runs. Catching `Exception` here (not just FileNotFoundError
+    # — older diffusers wraps it) and falling through to diffusers' default
+    # attention dispatch (SDPA / flash_attn local pkg if installed) lets the
+    # pipeline still run on Windows + RTX 5090.
+    def _try_backend(name: str) -> bool:
         try:
-            transformer.set_attention_backend("_flash_3_hub")
-        except Exception:
-            transformer.set_attention_backend("flash_hub")
+            transformer.set_attention_backend(name)
+            print(f"[helios] attention backend set: {name}")
+            return True
+        except Exception as e:
+            print(f"[helios] backend '{name}' unavailable: {type(e).__name__}: {str(e)[:120]}")
+            return False
+
+    if cuda_major >= 9:
+        # H100/H800 (SM90+) tries FA3 first, then FA2.
+        _try_backend("_flash_3_hub") or _try_backend("flash_hub") or print(
+            "[helios] no hub backend available; using diffusers default (SDPA)"
+        )
     else:
-        # 4090/A100 etc (SM89+) with FA2
-        transformer.set_attention_backend("flash_hub")
+        # 4090/A100/5090 etc — FA2 via hub if available, otherwise default SDPA.
+        _try_backend("flash_hub") or print(
+            "[helios] flash_hub unavailable; using diffusers default (SDPA)"
+        )
 
     vae = AutoencoderKLWan.from_pretrained(
         args.base_model_path,

@@ -11,13 +11,17 @@ try:
     flash_attn_func = flash_attn3.flash_attn_func
     flash_attn_varlen_func = flash_attn3.flash_attn_varlen_func
     print("Flash Attn 3 is installed!")
-except (ImportError, RuntimeError):
+# kernels.get_kernel raises FileNotFoundError when no matching variant exists
+# (the case on Windows — kernels-community/flash-attn{2,3} only ship Linux
+# prebuilds). Catch it alongside ImportError/RuntimeError so the fallback chain
+# (FA2 → sage → xformers → torch SDPA) gets a chance.
+except (ImportError, RuntimeError, FileNotFoundError):
     try:
         flash_attn2 = get_kernel("kernels-community/flash-attn2")
         flash_attn_func = flash_attn2.flash_attn_func
         flash_attn_varlen_func = flash_attn2.flash_attn_varlen_func
         print("Flash Attn 2 is installed!")
-    except ImportError:
+    except (ImportError, FileNotFoundError):
         print("Flash Attn 2 / 3 is not installed!")
         flash_attn_varlen_func = None
         flash_attn_func = None
