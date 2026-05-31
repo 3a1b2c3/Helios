@@ -241,18 +241,22 @@ def main():
         transformer = replace_rmsnorm_with_fp32(transformer)
         transformer = replace_all_norms_with_flash_norms(transformer)
         replace_rope_with_flash_rope()
-    # Prefer locally-installed `sageattention` (diffusers backend "_sage") over
-    # hub backends (`_flash_3_hub` / `flash_hub`) — those fetch
+    # Prefer locally-installed `flash_attn` (diffusers backend "flash") over hub
+    # backends (`flash_hub` / `_flash_3_hub`) -- those fetch
     # `kernels-community/flash-attn{2,3}` which ship Linux-only build variants
-    # and raise FileNotFoundError on Windows. sageattention is a universal
-    # py3-none-any wheel that JITs through Triton for sm_120; if it's missing,
-    # diffusers' default (SDPA) handles attention.
-    try:
-        transformer.set_attention_backend("_sage")
-        print("[helios] attention backend set: _sage (local sageattention)")
-    except Exception as e:
-        print(f"[helios] local _sage backend unavailable ({type(e).__name__}: {str(e)[:120]}); "
-              "using diffusers default (SDPA)")
+    # and raise FileNotFoundError on Windows. The mjun0812 prebuild wheel
+    # `flash_attn-2.8.3+cu128torch2.10-cp311-cp311-win_amd64.whl` is verified
+    # working on sm_120 (RTX 5090). If `flash_attn` isn't installed, fall back
+    # to sageattention then to diffusers' default (SDPA).
+    for _backend in ("flash", "sage", "flash_varlen", "sage_varlen"):
+        try:
+            transformer.set_attention_backend(_backend)
+            print(f"[helios] attention backend set: {_backend}")
+            break
+        except Exception as exc:  # noqa: BLE001
+            print(f"[helios] backend '{_backend}' unavailable: {type(exc).__name__}: {str(exc)[:120]}")
+    else:
+        print("[helios] no local attention backend available; using diffusers default (SDPA)")
 
     vae = AutoencoderKLWan.from_pretrained(
         args.base_model_path,

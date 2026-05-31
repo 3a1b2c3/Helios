@@ -32,12 +32,13 @@ if not defined HELIOS_LOG_REENTRY (
     echo Tail in another terminal:  Get-Content -Wait "!HELIOS_LOG!"
     echo.
     set "HELIOS_LOG_REENTRY=1"
-    REM Tee both stdout/stderr through to the console AND the log file so the
-    REM user sees live progress (incl. tqdm bars) and we still get a captured
-    REM artifact. Tee-Object writes UTF-16 LE on PS 5.1 (no -Encoding flag until
-    REM PS 7) but the file is still decodable; trade-off is acceptable vs.
-    REM ForEach-Object + Out-File which would break tqdm \r-redraws.
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%~f0' %* 2>&1 | Tee-Object -FilePath '!HELIOS_LOG!'; exit $LASTEXITCODE"
+    REM Tee stdout+stderr to console AND log file. The 2>&1 happens at cmd level
+    REM BEFORE the pipe to PowerShell, so PS 5.1 doesn't wrap each stderr write
+    REM as a NativeCommandError ErrorRecord (the red-text noise you'd otherwise
+    REM see at startup). Trade-off: cmd's pipe doesn't propagate the inner bat's
+    REM exit code through to ERRORLEVEL -- it reflects PowerShell's exit
+    REM instead -- so the actual python error code surfaces only inside the log.
+    call "%~f0" %* 2>&1 | powershell -NoProfile -ExecutionPolicy Bypass -Command "$input | Tee-Object -FilePath '!HELIOS_LOG!'"
     set "EXIT=!ERRORLEVEL!"
     echo.
     echo --- last 40 log lines ---
@@ -61,6 +62,45 @@ set "SKIP_RUN=0"
 :: Default to --low-vram: 5090 (32 GB) OOMs on Helios-14B at default settings.
 :: Pass --high-vram to opt out on hardware with more headroom.
 set "LOW_VRAM=1"
+:: Render dimensions. Defaults match Helios's distilled-checkpoint training-time
+:: small preset (fast iteration); override via --height N --width N for higher
+:: quality (e.g. 720 x 1280 matches the training resolution and noticeably
+:: improves output sharpness, at the cost of more VRAM and longer steps).
+set "HELIOS_HEIGHT=384"
+set "HELIOS_WIDTH=640"
+:: num_frames must be a multiple of 33 -- Helios processes video in 33-frame
+:: chunks (latent chunk size 9 * vae_scale_factor_temporal 4 + 1 = 33). The
+:: README's adjusted-frame table only lists 33*N values; passing 99 yields a
+:: ~4-second clip at 24 fps. See validation block below for the constraint.
+set "HELIOS_NUM_FRAMES=99"
+:: Group offload resident-window size (number of transformer blocks kept on GPU
+:: simultaneously). 4 is the upstream default and works for ~24 GB peak at
+:: 384x640. Drop to 2 or 1 if VRAM is tight (e.g. 720p+ on 5090) -- each step
+:: gets slower due to extra block swapping, but peak resident VRAM drops
+:: proportionally. Only matters when --low-vram is on (the default).
+set "HELIOS_NUM_BLOCKS_PER_GROUP=4"
+:: Variant picks the HF repo and -- importantly -- the guidance_scale, since
+:: the step-wise distilled model ignores guidance (bakes it in via DMD) while
+:: Mid and Base actually use it. Each variant ~131 GB on disk (separate cache).
+:: Default is base (highest-quality non-step-wise model). For fast iteration,
+:: pass --variant distilled (~5 min/video vs ~50-100 min for base).
+set "HELIOS_VARIANT=base"
+:: Random seed by default so each run varies; cmd's %%RANDOM%% returns 0-32767
+:: which is plenty for visual variety. Override with --seed N for reproducible
+:: runs. The chosen seed is echoed in the startup banner so you can replay it.
+set "HELIOS_SEED=!RANDOM!"
+:: i2v image-noise sigma controls how much the model deviates from the input
+:: image. Lower = stick close to input (less creative drift); higher = more
+:: drastic transformation. Helios defaults (0.111 / 0.135) are a moderate
+:: range; try 0.05-0.08 for tighter adherence or 0.15-0.25 for stronger
+:: motion/transformation. Only applies in --mode i2v.
+set "HELIOS_IMAGE_SIGMA_MIN=0.111"
+set "HELIOS_IMAGE_SIGMA_MAX=0.135"
+:: torch.compile fusion of transformer/text_encoder/vae forward passes. Takes
+:: ~5 min to JIT-compile the first step, then subsequent steps run ~10-20%%
+:: faster with marginally sharper output. Off by default since it adds startup
+:: cost; enable with --enable-compile when iterating with the same setup.
+set "HELIOS_ENABLE_COMPILE=0"
 :parse
 if "%~1"=="" goto args_done
 if /I "%~1"=="--mode"          ( set "MODE=%~2" & shift & shift & goto parse )
@@ -71,16 +111,94 @@ if /I "%~1"=="--skip-download" ( set "SKIP_DOWNLOAD=1" & shift & goto parse )
 if /I "%~1"=="--skip-run"      ( set "SKIP_RUN=1" & shift & goto parse )
 if /I "%~1"=="--low-vram"      ( set "LOW_VRAM=1" & shift & goto parse )
 if /I "%~1"=="--high-vram"     ( set "LOW_VRAM=0" & shift & goto parse )
+if /I "%~1"=="--height"        ( set "HELIOS_HEIGHT=%~2" & shift & shift & goto parse )
+if /I "%~1"=="--width"         ( set "HELIOS_WIDTH=%~2" & shift & shift & goto parse )
+if /I "%~1"=="--num_frames"    ( set "HELIOS_NUM_FRAMES=%~2" & shift & shift & goto parse )
+if /I "%~1"=="--num-frames"    ( set "HELIOS_NUM_FRAMES=%~2" & shift & shift & goto parse )
+if /I "%~1"=="--num_blocks_per_group" ( set "HELIOS_NUM_BLOCKS_PER_GROUP=%~2" & shift & shift & goto parse )
+if /I "%~1"=="--num-blocks-per-group" ( set "HELIOS_NUM_BLOCKS_PER_GROUP=%~2" & shift & shift & goto parse )
+if /I "%~1"=="--variant"       ( set "HELIOS_VARIANT=%~2" & shift & shift & goto parse )
+if /I "%~1"=="--seed"          ( set "HELIOS_SEED=%~2" & shift & shift & goto parse )
+if /I "%~1"=="--image_noise_sigma_min" ( set "HELIOS_IMAGE_SIGMA_MIN=%~2" & shift & shift & goto parse )
+if /I "%~1"=="--image-noise-sigma-min" ( set "HELIOS_IMAGE_SIGMA_MIN=%~2" & shift & shift & goto parse )
+if /I "%~1"=="--image_noise_sigma_max" ( set "HELIOS_IMAGE_SIGMA_MAX=%~2" & shift & shift & goto parse )
+if /I "%~1"=="--image-noise-sigma-max" ( set "HELIOS_IMAGE_SIGMA_MAX=%~2" & shift & shift & goto parse )
+if /I "%~1"=="--enable_compile" ( set "HELIOS_ENABLE_COMPILE=1" & shift & goto parse )
+if /I "%~1"=="--enable-compile" ( set "HELIOS_ENABLE_COMPILE=1" & shift & goto parse )
 if /I "%~1"=="--help"          goto :help
 if /I "%~1"=="-h"              goto :help
 echo ERROR: unknown arg %~1
 exit /b 2
 :args_done
 
-:: Distilled variant only — best efficiency on 5090, ~80 GB after filtering
-:: out the redundant transformer_ode mirror dir.
-set "VARIANT=distilled"
-set "HF_REPO=BestWishYsh/Helios-Distilled"
+REM Helios's official check (pipeline_helios_diffusers.py:314) only enforces
+REM `height % 16 == 0 and width % 16 == 0`. But empirically the pipeline has
+REM additional internal alignment expectations beyond that -- runs at H=720
+REM (45*16) crash at the end-of-loop `torch.cat` in pipeline_helios_diffusers.py:1328,
+REM and runs at H=736 (46*16) crash mid-denoise in stage2_sample's
+REM convert_flow_pred_to_x0 at scheduling_helios_diffusers.py:846. Both pass /16
+REM but fail because some part of the history-window / stage-2 chunk math wants
+REM larger power-of-2 alignment. Enforce /64 which covers all observed cases.
+REM Known-safe heights/widths: 384, 448, 512, 576, 640, 704, 768, 832, 896.
+REM Saves ~45 minutes of wasted denoising on bad values.
+set /a "_H_MOD = !HELIOS_HEIGHT! %% 64"
+set /a "_W_MOD = !HELIOS_WIDTH! %% 64"
+if not "!_H_MOD!"=="0" (
+    set /a "_H_LO = !HELIOS_HEIGHT! - !_H_MOD!"
+    set /a "_H_HI = !_H_LO! + 64"
+    echo ERROR: --height !HELIOS_HEIGHT! must be divisible by 64. Try !_H_LO! or !_H_HI!.
+    exit /b 2
+)
+if not "!_W_MOD!"=="0" (
+    set /a "_W_LO = !HELIOS_WIDTH! - !_W_MOD!"
+    set /a "_W_HI = !_W_LO! + 64"
+    echo ERROR: --width !HELIOS_WIDTH! must be divisible by 64. Try !_W_LO! or !_W_HI!.
+    exit /b 2
+)
+
+REM Helios processes video in 33-frame chunks (latent chunk size 9 * VAE temporal
+REM scale 4 + 1 = 33; documented in docs/README.md's "Example frame counts"
+REM table where all "Adjusted Frames" values are 33*N). Passing non-33*N values
+REM lets the pipeline auto-round but produces surprising output lengths; fail
+REM fast and hint at neighboring valid counts so the user picks deliberately.
+set /a "_F_MOD = !HELIOS_NUM_FRAMES! %% 33"
+if not "!_F_MOD!"=="0" (
+    set /a "_F_LO = !HELIOS_NUM_FRAMES! - !_F_MOD!"
+    set /a "_F_HI = !_F_LO! + 33"
+    echo ERROR: --num_frames !HELIOS_NUM_FRAMES! must be a multiple of 33 [Helios chunk size].
+    echo Try !_F_LO! or !_F_HI!.
+    echo Common values: 33, 66, 99 [default ~4s], 132 [~5.5s], 264 [~11s], 726 [~30s].
+    exit /b 2
+)
+
+:: Variant -> HF repo + guidance_scale + stage2-flag mapping.
+::   distilled (default): ~3 effective denoise steps, no guidance, pyramid stage2 ON, ~5 min/video
+::   mid:                ~30 steps, guidance=5.0, single-stage, ~50-100 min/video, ~20% quality gain
+::   base:               ~30 steps, guidance=5.0, single-stage, ~50-100 min/video, ~50-70% quality gain
+:: Each variant lives in a separate HF repo (~131 GB after filtering transformer_init).
+:: Step-wise distilled ignores --guidance_scale; Mid/Base actually use it.
+:: Stage2 mapping: Distilled's scheduler config has stages>1 (pyramid distillation)
+:: and REQUIRES --is_enable_stage2 to avoid KeyError: None at scheduling_helios_diffusers.py:227.
+:: Mid/Base have stages=1 (full single-stage denoising) and CRASH WITH --is_enable_stage2
+:: at pipeline_helios_diffusers.py:705 (KeyError: 1 when accessing ori_start_sigmas[1]
+:: because the scheduler only populated key 0). Override either default via HELIOS_NO_STAGE2.
+set "VARIANT=!HELIOS_VARIANT!"
+if /I "!VARIANT!"=="distilled" (
+    set "HF_REPO=BestWishYsh/Helios-Distilled"
+    set "HELIOS_GUIDANCE_SCALE=1.0"
+    set "_VARIANT_STAGE2_DEFAULT=1"
+) else if /I "!VARIANT!"=="mid" (
+    set "HF_REPO=BestWishYsh/Helios-Mid"
+    set "HELIOS_GUIDANCE_SCALE=5.0"
+    set "_VARIANT_STAGE2_DEFAULT=0"
+) else if /I "!VARIANT!"=="base" (
+    set "HF_REPO=BestWishYsh/Helios-Base"
+    set "HELIOS_GUIDANCE_SCALE=5.0"
+    set "_VARIANT_STAGE2_DEFAULT=0"
+) else (
+    echo ERROR: --variant must be distilled^|mid^|base ^(got !VARIANT!^)
+    exit /b 2
+)
 
 :: --- paths ---
 if not defined HELIOS_VENV set "HELIOS_VENV=%~dp0.venv"
@@ -110,7 +228,13 @@ echo Helios real-time long video generation
 echo ============================================================
 echo   venv     : !HELIOS_VENV!
 echo   mode     : %MODE%
-echo   variant  : distilled  ^(repo: !HF_REPO!^)
+echo   variant  : !VARIANT!  ^(repo: !HF_REPO!, guidance_scale: !HELIOS_GUIDANCE_SCALE!^)
+echo   seed     : !HELIOS_SEED!  ^(override with --seed N to reproduce^)
+if "!_VARIANT_STAGE2_DEFAULT!"=="1" (
+    echo   stage2   : ON  ^(--is_enable_stage2; required for distilled pyramid^)
+) else (
+    echo   stage2   : OFF ^(single-stage; correct for Mid/Base^)
+)
 echo   low-vram : %LOW_VRAM%  ^(group offload on if 1^)
 echo   skip     : setup=%SKIP_SETUP%  download=%SKIP_DOWNLOAD%  run=%SKIP_RUN%
 echo ============================================================
@@ -233,6 +357,48 @@ if "%SKIP_RUN%"=="1" (
     exit /b 0
 )
 
+:: --- CUDA / GPU sanity probe -------------------------------------------------
+:: torch+cu128 wheels ship their own CUDA runtime DLLs so the toolkit doesn't
+:: need to be on PATH at inference time, but a functioning NVIDIA driver is
+:: required. Probe via nvidia-smi up front so OOMs / driver errors surface
+:: here with the actual GPU state instead of inside a 40-line python trace.
+echo --- GPU / CUDA probe ---
+where nvidia-smi >nul 2>nul
+if errorlevel 1 (
+    echo WARN: nvidia-smi not on PATH -- CUDA driver may be missing; inference will fail.
+) else (
+    REM driver_version isn't accepted as a --query-gpu field on every driver
+    REM build (some report it only via the top-level header); query it as a
+    REM separate gpu-summary line instead.
+    for /f "delims=" %%G in ('nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free --format=csv,noheader,nounits 2^>nul') do echo   GPU: %%G
+    for /f "delims=" %%D in ('nvidia-smi --query --display=COMPUTE 2^>nul ^| findstr /C:"Driver Version"') do echo   %%D
+)
+set "_TK_CU128=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+if exist "!_TK_CU128!" (
+    echo   CUDA 12.8 toolkit: found at !_TK_CU128!
+) else (
+    echo   CUDA 12.8 toolkit: not installed ^(optional; torch+cu128 wheels include the runtime^)
+)
+echo   CUDA_PATH    : %CUDA_PATH%
+echo   CUDA_HOME    : %CUDA_HOME%
+REM Warn if CUDA_PATH points at a non-12.8 toolkit -- torch+cu128 wheels will
+REM still work via their bundled runtime, but custom CUDA-extension builds (e.g.
+REM sageattention's Triton JIT, lingbot's gsplat) link against whatever CUDA_PATH
+REM resolves to, and a mismatch produces obscure "no kernel image" runtime errors.
+if defined CUDA_PATH (
+    echo %CUDA_PATH% | findstr /C:"v12.8" >nul
+    if errorlevel 1 (
+        echo   WARN: CUDA_PATH does not point at v12.8 -- custom-built kernels may mismatch torch's bundled runtime
+    )
+)
+where nvcc >nul 2>nul
+if errorlevel 1 (
+    echo   nvcc         : not on PATH ^(OK for inference; needed only for CUDA-extension builds^)
+) else (
+    for /f "tokens=*" %%V in ('nvcc --version 2^>nul ^| findstr /C:"release"') do echo   nvcc         : %%V
+)
+echo.
+
 :: --- Windows env tweaks (same as run_matrixgame3.bat / run_cosmos.bat) ---
 if not defined GLOO_SOCKET_IFNAME set "GLOO_SOCKET_IFNAME=Wi-Fi"
 set "HF_DEACTIVATE_ASYNC_LOAD=1"
@@ -253,9 +419,16 @@ set "CUDA_VISIBLE_DEVICES=0"
 ::     stage_timesteps = self.timesteps_per_stage[stage_index]
 :: because stage_index defaults to None on that call. Override stage2 off via
 :: HELIOS_NO_STAGE2=1 if you ever point this at a single-stage checkpoint.
-set "STAGE2_ARG=--is_enable_stage2"
+:: Variant-specific default is set above (_VARIANT_STAGE2_DEFAULT): 1 for Distilled
+:: (needs --is_enable_stage2), 0 for Mid/Base (crash if --is_enable_stage2 passed).
+set "STAGE2_ARG="
+if "!_VARIANT_STAGE2_DEFAULT!"=="1" set "STAGE2_ARG=--is_enable_stage2"
 if defined HELIOS_NO_STAGE2 if not "%HELIOS_NO_STAGE2%"=="0" set "STAGE2_ARG="
-set "COMMON_ARGS=--base_model_path !HF_REPO! --transformer_path !HF_REPO! --weight_dtype bf16 --height 384 --width 640 --num_frames 99 --fps 24 --guidance_scale 5.0 --seed 42 --output_folder %~dp0output_helios !STAGE2_ARG!"
+if defined HELIOS_FORCE_STAGE2 if not "%HELIOS_FORCE_STAGE2%"=="0" set "STAGE2_ARG=--is_enable_stage2"
+REM Guidance scale comes from the variant mapping above: 1.0 for distilled
+REM (which bakes guidance in via DMD and ignores the runtime arg) vs 5.0 for
+REM Mid/Base (which actually use it and otherwise produce blurry, low-CFG output).
+set "COMMON_ARGS=--base_model_path !HF_REPO! --transformer_path !HF_REPO! --weight_dtype bf16 --height !HELIOS_HEIGHT! --width !HELIOS_WIDTH! --num_frames !HELIOS_NUM_FRAMES! --fps 24 --guidance_scale !HELIOS_GUIDANCE_SCALE! --seed !HELIOS_SEED! --output_folder %~dp0output_helios !STAGE2_ARG!"
 
 :: Prompts and per-mode extra args. The PROMPT variable holds the text WITHOUT
 :: enclosing quotes — quoting happens at the python.exe invocation line below.
@@ -270,7 +443,7 @@ if /I "%MODE%"=="t2v" (
     set "PROMPT=A vibrant tropical fish swimming gracefully among colorful coral reefs in a clear, turquoise ocean. Bright blue and yellow scales, dynamic motion, close-up shot."
 )
 if /I "%MODE%"=="i2v" (
-    set "MODE_ARGS=--sample_type i2v --image_path %~dp0example\wave.jpg --image_noise_sigma_min 0.111 --image_noise_sigma_max 0.135"
+    set "MODE_ARGS=--sample_type i2v --image_path %~dp0example\wave.jpg --image_noise_sigma_min !HELIOS_IMAGE_SIGMA_MIN! --image_noise_sigma_max !HELIOS_IMAGE_SIGMA_MAX!"
     set "PROMPT=A towering emerald wave surges forward, its crest curling with raw power. Sunlight glints off the translucent water. Dynamic motion, cinematic shot."
 )
 if /I "%MODE%"=="v2v" (
@@ -283,7 +456,10 @@ if not defined MODE_ARGS (
 )
 
 set "LOW_VRAM_ARGS="
-if "%LOW_VRAM%"=="1" set "LOW_VRAM_ARGS=--enable_low_vram_mode --group_offloading_type leaf_level --num_blocks_per_group 4"
+if "%LOW_VRAM%"=="1" set "LOW_VRAM_ARGS=--enable_low_vram_mode --group_offloading_type leaf_level --num_blocks_per_group !HELIOS_NUM_BLOCKS_PER_GROUP!"
+
+set "COMPILE_ARGS="
+if "!HELIOS_ENABLE_COMPILE!"=="1" set "COMPILE_ARGS=--enable_compile"
 
 echo --- running infer_helios.py ---
 echo   python   : !VENV_PY!
@@ -291,9 +467,48 @@ echo   entry    : !ENTRY!
 echo   output   : %~dp0output_helios\
 echo.
 
+:: Capture inference start time as ticks (UTC, 100ns units). Computing wall
+:: clock from cmd's %TIME% is messy because of midnight rollovers; use
+:: PowerShell's DateTime.UtcNow.Ticks for a monotonic high-res integer instead.
+for /f %%T in ('powershell -NoProfile -Command "[DateTime]::UtcNow.Ticks"') do set "_T_START=%%T"
+
+:: Background RAM sampler: polls every 2s for the largest python.exe working
+:: set and writes the running peak (bytes + GB) to a temp file. Identified by
+:: its command line containing the unique metrics-file path so we can find +
+:: kill it cleanly after the python invocation finishes (no PID juggling).
+set "_METRICS_FILE=%TEMP%\helios_metrics_%RANDOM%.txt"
+echo 0 0 > "%_METRICS_FILE%"
+start /b "" powershell -NoProfile -WindowStyle Hidden -Command "$peak=0; while ($true) { try { $m=(Get-Process python -ErrorAction SilentlyContinue | Measure-Object WorkingSet64 -Maximum).Maximum; if ($m -and $m -gt $peak) { $peak=$m; '{0} {1:N2}' -f $peak, ($peak/1GB) | Out-File -LiteralPath '%_METRICS_FILE%' -Force -Encoding ascii } } catch {}; Start-Sleep -Seconds 2 }"
+
+:: Also snapshot GPU VRAM peak (sample every 2s in parallel)
+set "_GPU_FILE=%TEMP%\helios_gpu_peak_%RANDOM%.txt"
+echo 0 > "%_GPU_FILE%"
+start /b "" powershell -NoProfile -WindowStyle Hidden -Command "$peak=0; while ($true) { try { $m=(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>$null | ForEach-Object { [int]$_.Trim() } | Measure-Object -Maximum).Maximum; if ($m -and $m -gt $peak) { $peak=$m; $peak | Out-File -LiteralPath '%_GPU_FILE%' -Force -Encoding ascii } } catch {}; Start-Sleep -Seconds 2 }"
+
+echo --- inference start: %TIME% ---
+
 :: Python's -X utf8 guarantees UTF-8 stdout/stderr so the bat-level log is decodable.
-"!VENV_PY!" -X utf8 "!ENTRY!" %COMMON_ARGS% %MODE_ARGS% --prompt "!PROMPT!" %LOW_VRAM_ARGS%
+"!VENV_PY!" -X utf8 "!ENTRY!" %COMMON_ARGS% %MODE_ARGS% --prompt "!PROMPT!" %LOW_VRAM_ARGS% %COMPILE_ARGS%
 set "EXIT_CODE=!ERRORLEVEL!"
+
+REM Stop the background samplers (find by metrics-file path in their cmdline)
+powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'powershell.exe' -and ($_.CommandLine -match 'helios_metrics_' -or $_.CommandLine -match 'helios_gpu_peak_') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+
+REM Compute elapsed wall clock. 1 tick = 100ns -> divide by 10000000 to get
+REM seconds. PowerShell handles the arithmetic + formatting in a single call.
+for /f %%T in ('powershell -NoProfile -Command "[DateTime]::UtcNow.Ticks"') do set "_T_END=%%T"
+for /f %%E in ('powershell -NoProfile -Command "$d=([TimeSpan]::FromTicks(!_T_END! - !_T_START!)); '{0:00}:{1:00}:{2:00}.{3:000}' -f $d.Hours,$d.Minutes,$d.Seconds,$d.Milliseconds"') do set "_T_ELAPSED=%%E"
+
+REM Read peak metrics from temp files (each file format: "bytes GB" or just MiB)
+set "_RAM_PEAK_GB=?"
+for /f "tokens=2" %%R in ('type "!_METRICS_FILE!" 2^>nul') do set "_RAM_PEAK_GB=%%R"
+set "_GPU_PEAK_MIB=?"
+for /f %%G in ('type "!_GPU_FILE!" 2^>nul') do set "_GPU_PEAK_MIB=%%G"
+del /q "!_METRICS_FILE!" "!_GPU_FILE!" >nul 2>nul
+
+echo --- inference end:   %TIME%  (elapsed: !_T_ELAPSED!) ---
+echo --- peak python RAM: !_RAM_PEAK_GB! GB ---
+echo --- peak GPU VRAM:   !_GPU_PEAK_MIB! MiB ---
 
 if not !EXIT_CODE!==0 (
     echo.
@@ -318,6 +533,8 @@ echo   run_helios.bat --skip-run               download only, don't run inferenc
 echo   run_helios.bat --setup                  full flow ^(setup + download + run^)
 echo   run_helios.bat --mode i2v               image-to-video
 echo   run_helios.bat --mode v2v               video-to-video
+echo   run_helios.bat --variant base           use Helios-Base ^(higher quality, ~131 GB extra download, ~50-100 min/video^)
+echo   run_helios.bat --variant mid            use Helios-Mid ^(moderate-quality intermediate^)
 echo   run_helios.bat --skip-download          skip download ^(assume cached^)
 echo   run_helios.bat --low-vram               group offload ^(default^)
 echo   run_helios.bat --high-vram              disable group offload ^(needs ^>32 GB VRAM^)
