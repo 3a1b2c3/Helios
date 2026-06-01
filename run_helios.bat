@@ -498,6 +498,7 @@ REM Compute elapsed wall clock. 1 tick = 100ns -> divide by 10000000 to get
 REM seconds. PowerShell handles the arithmetic + formatting in a single call.
 for /f %%T in ('powershell -NoProfile -Command "[DateTime]::UtcNow.Ticks"') do set "_T_END=%%T"
 for /f %%E in ('powershell -NoProfile -Command "$d=([TimeSpan]::FromTicks(!_T_END! - !_T_START!)); '{0:00}:{1:00}:{2:00}.{3:000}' -f $d.Hours,$d.Minutes,$d.Seconds,$d.Milliseconds"') do set "_T_ELAPSED=%%E"
+for /f %%S in ('powershell -NoProfile -Command "[Math]::Round(([TimeSpan]::FromTicks(!_T_END! - !_T_START!)).TotalSeconds, 1)"') do set "_T_ELAPSED_SEC=%%S"
 
 REM Read peak metrics from temp files (each file format: "bytes GB" or just MiB)
 set "_RAM_PEAK_GB=?"
@@ -506,9 +507,16 @@ set "_GPU_PEAK_MIB=?"
 for /f %%G in ('type "!_GPU_FILE!" 2^>nul') do set "_GPU_PEAK_MIB=%%G"
 del /q "!_METRICS_FILE!" "!_GPU_FILE!" >nul 2>nul
 
+REM Compute generation speed: real fps (frames produced per wall-clock second)
+REM and s/frame. Helios writes one mp4 per run, so videos == 1 and total
+REM frames == HELIOS_NUM_FRAMES (already validated /33 above).
+for /f %%F in ('powershell -NoProfile -Command "if (!_T_ELAPSED_SEC! -gt 0) { [Math]::Round(!HELIOS_NUM_FRAMES! / !_T_ELAPSED_SEC!, 3) } else { 0 }"') do set "_REAL_FPS=%%F"
+for /f %%P in ('powershell -NoProfile -Command "if (!HELIOS_NUM_FRAMES! -gt 0) { [Math]::Round(!_T_ELAPSED_SEC! / !HELIOS_NUM_FRAMES!, 2) } else { 0 }"') do set "_SEC_PER_FRAME=%%P"
+
 echo --- inference end:   %TIME%  (elapsed: !_T_ELAPSED!) ---
 echo --- peak python RAM: !_RAM_PEAK_GB! GB ---
 echo --- peak GPU VRAM:   !_GPU_PEAK_MIB! MiB ---
+echo --- generation speed: !_REAL_FPS! frames/sec wall-clock  ^|  !_SEC_PER_FRAME! sec/frame  ^|  !HELIOS_NUM_FRAMES! frames in !_T_ELAPSED_SEC! sec ---
 
 if not !EXIT_CODE!==0 (
     echo.
