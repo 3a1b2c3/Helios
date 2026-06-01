@@ -26,8 +26,13 @@
 if not defined HELIOS_LOG_REENTRY (
     setlocal EnableExtensions EnableDelayedExpansion
     if not exist "%~dp0logs" mkdir "%~dp0logs"
-    for /f "tokens=2 delims==" %%I in ('wmic os get localdatetime /value ^| findstr "="') do set "LDT=%%I"
-    set "HELIOS_LOG=%~dp0logs\helios_!LDT:~0,8!_!LDT:~8,6!.log"
+    REM wmic was deprecated in Windows 11 23H2 and removed in many recent
+    REM installs -- when it returns nothing the LDT var stays empty and the
+    REM log filename comes out as literal "helios_~0,8LDT:~8,6.log".
+    REM PowerShell's Get-Date is available on every supported Windows.
+    for /f %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "_TS=%%T"
+    if not defined _TS set "_TS=unknown"
+    set "HELIOS_LOG=%~dp0logs\helios_!_TS!.log"
     echo Helios run logging to: !HELIOS_LOG!
     echo Tail in another terminal:  Get-Content -Wait "!HELIOS_LOG!"
     echo.
@@ -428,7 +433,12 @@ if defined HELIOS_FORCE_STAGE2 if not "%HELIOS_FORCE_STAGE2%"=="0" set "STAGE2_A
 REM Guidance scale comes from the variant mapping above: 1.0 for distilled
 REM (which bakes guidance in via DMD and ignores the runtime arg) vs 5.0 for
 REM Mid/Base (which actually use it and otherwise produce blurry, low-CFG output).
-set "COMMON_ARGS=--base_model_path !HF_REPO! --transformer_path !HF_REPO! --weight_dtype bf16 --height !HELIOS_HEIGHT! --width !HELIOS_WIDTH! --num_frames !HELIOS_NUM_FRAMES! --fps 24 --guidance_scale !HELIOS_GUIDANCE_SCALE! --seed !HELIOS_SEED! --output_folder %~dp0output_helios !STAGE2_ARG!"
+REM Output folder defaults to %~dp0output_helios but can be overridden via
+REM HELIOS_OUTPUT_FOLDER env (used by drive_helios_i2v.bat to redirect single-
+REM example runs into a dedicated dir). The output folder is created by Python.
+if not defined HELIOS_OUTPUT_FOLDER set "HELIOS_OUTPUT_FOLDER=%~dp0output_helios"
+
+set "COMMON_ARGS=--base_model_path !HF_REPO! --transformer_path !HF_REPO! --weight_dtype bf16 --height !HELIOS_HEIGHT! --width !HELIOS_WIDTH! --num_frames !HELIOS_NUM_FRAMES! --fps 24 --guidance_scale !HELIOS_GUIDANCE_SCALE! --seed !HELIOS_SEED! --output_folder !HELIOS_OUTPUT_FOLDER! !STAGE2_ARG!"
 
 :: Prompts and per-mode extra args. The PROMPT variable holds the text WITHOUT
 :: enclosing quotes — quoting happens at the python.exe invocation line below.
@@ -443,17 +453,24 @@ if /I "%MODE%"=="t2v" (
     set "PROMPT=A vibrant tropical fish swimming gracefully among colorful coral reefs in a clear, turquoise ocean. Bright blue and yellow scales, dynamic motion, close-up shot."
 )
 if /I "%MODE%"=="i2v" (
-    set "MODE_ARGS=--sample_type i2v --image_path %~dp0example\wave.jpg --image_noise_sigma_min !HELIOS_IMAGE_SIGMA_MIN! --image_noise_sigma_max !HELIOS_IMAGE_SIGMA_MAX!"
+    REM HELIOS_IMAGE_PATH overrides the default wave.jpg conditioning image
+    REM (used by drive_helios_i2v.bat to feed a per-run extracted first-frame PNG).
+    if not defined HELIOS_IMAGE_PATH set "HELIOS_IMAGE_PATH=%~dp0example\wave.jpg"
+    set "MODE_ARGS=--sample_type i2v --image_path !HELIOS_IMAGE_PATH! --image_noise_sigma_min !HELIOS_IMAGE_SIGMA_MIN! --image_noise_sigma_max !HELIOS_IMAGE_SIGMA_MAX!"
     set "PROMPT=A towering emerald wave surges forward, its crest curling with raw power. Sunlight glints off the translucent water. Dynamic motion, cinematic shot."
 )
 if /I "%MODE%"=="v2v" (
-    set "MODE_ARGS=--sample_type v2v --video_path %~dp0example\car.mp4"
-    set "PROMPT=A red sports car driving down a winding mountain road at dusk. Cinematic, dynamic motion."
+    set "MODE_ARGS=--sample_type v2v --video_path %~dp0example\racer\racer.mp4"
+    set "PROMPT=A fast-paced RC car race through a suburban street on a sunny day, with the miniature vehicle zipping past houses, driveways, and mailboxes, accompanied by the hum of its motor and the cheerful sounds of children playing in the background."
 )
 if not defined MODE_ARGS (
     echo ERROR: --mode must be t2v^|i2v^|v2v ^(got %MODE%^)
     exit /b 2
 )
+
+REM Optional prompt override (used by drive_helios_i2v.bat for single-example
+REM runs that need a custom prompt instead of the per-mode default).
+if defined HELIOS_PROMPT_OVERRIDE if not "!HELIOS_PROMPT_OVERRIDE!"=="" set "PROMPT=!HELIOS_PROMPT_OVERRIDE!"
 
 set "LOW_VRAM_ARGS="
 if "%LOW_VRAM%"=="1" set "LOW_VRAM_ARGS=--enable_low_vram_mode --group_offloading_type leaf_level --num_blocks_per_group !HELIOS_NUM_BLOCKS_PER_GROUP!"
