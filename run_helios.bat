@@ -25,6 +25,11 @@
 :: Tail in another terminal:  Get-Content -Wait "<path printed below>"
 if not defined HELIOS_LOG_REENTRY (
     setlocal EnableExtensions EnableDelayedExpansion
+    REM Switch cmd to UTF-8 code page so tqdm box-drawing chars don't
+    REM render as mojibake. Required because PYTHONIOENCODING=utf-8 only
+    REM fixes Python output encoding; the console still decodes bytes via
+    REM the cmd code page (defaults to cp1252 on en-US Windows).
+    chcp 65001 >nul
     if not exist "%~dp0logs" mkdir "%~dp0logs"
     REM wmic was deprecated in Windows 11 23H2 and removed in many recent
     REM installs -- when it returns nothing the LDT var stays empty and the
@@ -32,7 +37,10 @@ if not defined HELIOS_LOG_REENTRY (
     REM PowerShell's Get-Date is available on every supported Windows.
     for /f %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "_TS=%%T"
     if not defined _TS set "_TS=unknown"
-    set "HELIOS_LOG=%~dp0logs\helios_!_TS!.log"
+    REM Append a random suffix to avoid collisions when two runs land in the
+    REM same second (the previous deterministic name caused "file is being used
+    REM by another process" errors when re-running quickly after a crash).
+    set "HELIOS_LOG=%~dp0logs\helios_!_TS!_!RANDOM!.log"
     echo Helios run logging to: !HELIOS_LOG!
     echo Tail in another terminal:  Get-Content -Wait "!HELIOS_LOG!"
     echo.
@@ -408,6 +416,15 @@ echo.
 if not defined GLOO_SOCKET_IFNAME set "GLOO_SOCKET_IFNAME=Wi-Fi"
 set "HF_DEACTIVATE_ASYNC_LOAD=1"
 set "HF_HUB_ENABLE_HF_TRANSFER=0"
+:: HF_HUB_OFFLINE=1 sounds nice (skips the redundant "Fetching N files"
+:: ETag pass) but it breaks Helios startup: helios.modules.helios_kernels
+:: calls get_kernel("kernels-community/flash-attn3") at import time, which
+:: needs the HF Hub API to enumerate kernel variants -- that's a NETWORK
+:: call, and OfflineModeIsEnabled raises before any model load happens.
+:: Leave HF_HUB_OFFLINE UNSET so the kernels-hub probe can talk to HF.
+:: (The kernel lookup is fine on Windows -- it falls back to SDPA when no
+:: variant matches; only the network reachability matters.)
+:: set "HF_HUB_OFFLINE=1"
 set "USE_LIBUV=0"
 set "TORCH_TCPSTORE_USE_LIBUV=0"
 set "PYTHONIOENCODING=utf-8"
@@ -539,9 +556,13 @@ if not !EXIT_CODE!==0 (
     echo.
     echo ERROR: infer_helios exited with code !EXIT_CODE!
     echo Common causes:
-    echo   - OOM on 5090: retry with --low-vram
+    echo   - OOM on 5090: --low-vram is already default; if still OOM, drop --height/--width
+    echo     ^(720x1280 + 99 frames exceeds 32 GB even with group-offload^), or lower
+    echo     --num_blocks_per_group from 4 to 2 or 1 to swap blocks more aggressively
+    echo   - Pagefile too small ^(os error 1455^): increase Windows pagefile to 64+ GB
+    echo     ^(Settings ^> Performance Options ^> Virtual memory^) or pass disable_mmap=True
     echo   - Missing CUDA toolkit: ensure CUDA 12.8 runtime is on PATH
-    echo   - flash-attn / triton missing on Windows: --enable_compile drops a warning, output still ok
+    echo   - triton-windows already installed; --enable_compile JITs against torch 2.10
     exit /b !EXIT_CODE!
 )
 

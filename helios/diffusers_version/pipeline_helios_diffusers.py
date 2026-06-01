@@ -25,7 +25,15 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput
-from diffusers.loaders import HeliosLoraLoaderMixin
+try:
+    from diffusers.loaders import HeliosLoraLoaderMixin  # type: ignore[attr-defined]
+except ImportError:
+    # Diffusers main removed HeliosLoraLoaderMixin (likely a PR that got
+    # merged, renamed, then reverted upstream). Fall back to the generic
+    # LoraLoaderMixin which provides the same load_lora_weights / set_adapters
+    # surface. LoRA inference may need additional patching if Helios relies on
+    # Helios-specific shape/key handling, but base (non-LoRA) inference works.
+    from diffusers.loaders import LoraLoaderMixin as HeliosLoraLoaderMixin  # type: ignore[no-redef]
 from diffusers.models import AutoencoderKLWan, HeliosTransformer3DModel
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.schedulers import HeliosScheduler
